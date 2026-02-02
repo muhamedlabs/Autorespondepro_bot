@@ -1,5 +1,6 @@
 import sys
 import asyncio
+import time
 from html import escape
 from telegram import Bot
 from telegram.error import TimedOut, NetworkError
@@ -22,16 +23,17 @@ class ConsoleToTelegram:
         self._delay_active = True
         self._buffer: list[str] = []
 
-        # Анти-спам повторяющихся сообщений
-        self._last_message: str | None = None
-        self._last_message_time: float = 0.0
+        # 🔒 Анти-спам по событиям
+        self._event_cache: dict[str, float] = {}
         self._repeat_block_seconds = 15
 
+    # ================= ИНИЦИАЛИЗАЦИЯ =================
+
     async def init_bot(self):
-        """Инициализация бота с повторными попытками при ошибках подключения"""
+        """Инициализация бота с повторными попытками"""
         max_retries = 3
         retry_delay = 5
-        
+
         for attempt in range(max_retries):
             try:
                 self.bot = Bot(token=telegram_bots)
@@ -60,24 +62,24 @@ class ConsoleToTelegram:
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay)
                     retry_delay *= 2
-                else:
-                    return False
             except Exception:
                 return False
 
+        return False
+
+    # ================= БУФЕР =================
+
     async def _delayed_flush(self):
-        """Обработка буферизированных сообщений после задержки"""
+        """Отправка буферизированных сообщений после задержки"""
         await asyncio.sleep(self._delay_seconds)
         self._delay_active = False
 
         for msg in self._buffer:
-            try:
-                await self._send_with_retry(msg)
-                await asyncio.sleep(0.05)
-            except Exception:
-                pass
+            await self._send_with_retry(msg)
 
         self._buffer.clear()
+
+    # ================= STDOUT =================
 
     def write(self, text):
         self.original_stdout.write(text)
@@ -102,61 +104,69 @@ class ConsoleToTelegram:
     def flush(self):
         self.original_stdout.flush()
 
-    async def _send_with_retry(self, text: str):
-        max_retries = 2
-        retry_delay = 1
+    # ================= ПУБЛИЧНЫЙ API =================
 
-        for attempt in range(max_retries):
+    async def send_log(self, text: str, event_key: str | None = None):
+        """Отправка лог-сообщения с анти-повтором"""
+        if not self._can_send(event_key):
+            return
+
+        await self._send_with_retry(text)
+
+    def _can_send(self, event_key: str | None) -> bool:
+        """Проверка, можно ли отправлять событие"""
+        if not event_key:
+            return True
+
+        now = time.time()
+        last_time = self._event_cache.get(event_key)
+
+        if last_time and (now - last_time) < self._repeat_block_seconds:
+            return False
+
+        self._event_cache[event_key] = now
+        return True
+
+    # ================= ОТПРАВКА =================
+
+    async def _send_with_retry(self, text: str):
+        for _ in range(2):
             try:
                 return await self._send(text)
             except (TimedOut, NetworkError):
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
+                await asyncio.sleep(1)
             except Exception:
-                break
+                return
 
     async def _send(self, text: str):
-        try:
-            clean = text.rstrip()
-            if not clean or not self.bot:
-                return
+        if not self.bot:
+            return
 
-            now = asyncio.get_running_loop().time()
+        clean = text.rstrip()
+        if not clean:
+            return
 
-            # Блок повторяющихся сообщений (15 сек)
-            if (
-                clean == self._last_message
-                and now - self._last_message_time < self._repeat_block_seconds
-            ):
-                return
+        safe_text = escape(clean)
+        MAX_LEN = 4000
 
-            self._last_message = clean
-            self._last_message_time = now
-
-            safe_text = escape(clean)
-            MAX_LEN = 4000
-
-            if len(safe_text) > MAX_LEN:
-                for i in range(0, len(safe_text), MAX_LEN):
-                    await self.bot.send_message(
-                        chat_id=TG_CHANNEL_ID,
-                        text=safe_text[i:i + MAX_LEN],
-                        parse_mode="HTML"
-                    )
-                    await asyncio.sleep(0.05)
-            else:
+        if len(safe_text) > MAX_LEN:
+            for i in range(0, len(safe_text), MAX_LEN):
                 await self.bot.send_message(
                     chat_id=TG_CHANNEL_ID,
-                    text=safe_text,
+                    text=safe_text[i:i + MAX_LEN],
                     parse_mode="HTML"
                 )
-
-        except Exception:
-            pass
+                await asyncio.sleep(0.05)
+        else:
+            await self.bot.send_message(
+                chat_id=TG_CHANNEL_ID,
+                text=safe_text,
+                parse_mode="HTML"
+            )
 
 
 # ===== Глобальный экземпляр =====
+
 _console_logger: ConsoleToTelegram | None = None
 
 
