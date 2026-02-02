@@ -4,6 +4,7 @@ import importlib
 import sys
 from pathlib import Path
 from telegram.ext import ApplicationBuilder
+from telegram.error import TimedOut, NetworkError
 from BANNED_FILES.config import telegram_bots
 
 def create_app():
@@ -55,37 +56,79 @@ def load_commands_from_terminal(app):
     return app
 
 async def start_mini_bot():
-    """Запуск мини-бота"""
-    # Создаем приложение
-    app = create_app()
+    """Запуск мини-бота с повторными попытками подключения"""
+    max_retries = 5
+    base_delay = 3  # начальная задержка в секундах
     
-    # Загружаем команды из папки terminal
-    load_commands_from_terminal(app)
+    for attempt in range(max_retries):
+        try:
+            # Создаем приложение с увеличенными таймаутами
+            app = ApplicationBuilder() \
+                .token(telegram_bots) \
+                .connect_timeout(30.0) \
+                .read_timeout(30.0) \
+                .write_timeout(30.0) \
+                .pool_timeout(30.0) \
+                .build()
+            
+            # Загружаем команды из папки terminal
+            load_commands_from_terminal(app)
+            
+            # Инициализируем и запускаем бота
+            await app.initialize()
+            await app.start()
+            
+            # Запускаем polling
+            await app.updater.start_polling()
+            
+            print("MiniBot is already operating asynchronously!")
+            return app
+            
+        except (TimedOut, NetworkError) as e:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)  # Экспоненциальная задержка
+                print(f"Ошибка подключения: {e}. Повтор через {delay} секунд...")
+                await asyncio.sleep(delay)
+            else:
+                print(f"Все {max_retries} попыток подключения провалились: {e}")
+                raise
+        except Exception as e:
+            print(f"Неожиданная ошибка при запуске бота: {e}")
+            raise
     
-    # Инициализируем и запускаем бота
-    await app.initialize()
-    await app.start()
-    
-    # Запускаем polling
-    await app.updater.start_polling()
-    
-    print("MiniBot is already operating asynchronously!")
-    
-    # Возвращаем app для контроля
-    return app
+    return None
 
 # Если файл запускается отдельно
 if __name__ == "__main__":
     async def main():
-        app = await start_mini_bot()
         try:
-            # Бесконечный цикл
-            while True:
-                await asyncio.sleep(3600)
-        except KeyboardInterrupt:
-            print("Остановка мини-бота...")
-            await app.updater.stop()
-            await app.stop()
-            await app.shutdown()
+            app = await start_mini_bot()
+            if not app:
+                print("Не удалось запустить бота")
+                return
+                
+            try:
+                # Бесконечный цикл с периодической проверкой
+                while True:
+                    # Проверяем, что бот все еще работает
+                    await asyncio.sleep(300)  # Проверка каждые 5 минут
+                    
+            except KeyboardInterrupt:
+                print("\nОстановка мини-бота...")
+            except Exception as e:
+                print(f"Ошибка в основном цикле: {e}")
+            finally:
+                # Корректное завершение
+                if app:
+                    try:
+                        await app.updater.stop()
+                        await app.stop()
+                        await app.shutdown()
+                    except Exception as e:
+                        print(f"Ошибка при завершении: {e}")
+                print("Бот остановлен")
+                
+        except Exception as e:
+            print(f"Критическая ошибка: {e}")
     
     asyncio.run(main())
