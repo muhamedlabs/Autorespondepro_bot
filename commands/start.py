@@ -7,117 +7,147 @@ from redis_storage.users_info import UsersInfo
 from language_file.transcribation.UserLanguage import get_user_language
 from language_file.main import get_translation
 
-# Инициализация Redis
+# ===== Redis =====
 redis = RedisManager()
 
-# Локи пользователей для защиты от спама
-user_locks = {}
-LOCK_EXPIRATION = 10  # Время жизни локи в секундах
+# ===== Локи пользователей =====
+user_locks: dict[str, bool] = {}
+LOCK_EXPIRATION = 10  # секунд
 
-# === Время по Украине (всегда UTC+2) ===
+# ===== Анти-дубль логов (по тексту) =====
+_last_log_text: str | None = None
+_last_log_time: float = 0.0
+LOG_BLOCK_SECONDS = 15
+
+
+def safe_log(text: str):
+    """
+    Печатает лог, если он не повторяется в течение LOG_BLOCK_SECONDS
+    """
+    global _last_log_text, _last_log_time
+
+    now = asyncio.get_running_loop().time()
+
+    if text == _last_log_text and now - _last_log_time < LOG_BLOCK_SECONDS:
+        return
+
+    _last_log_text = text
+    _last_log_time = now
+    print(text)
+
+
+# ===== Время Украина (UTC+2) =====
 def get_ukraine_time():
-    """Возвращает текущее время по Украине (всегда UTC+2)"""
     return datetime.utcnow() + timedelta(hours=2)
 
+
 def format_ukraine_time(dt=None):
-    """Форматирует время в формат '18.12.25 18:46:35' по Украине (UTC+2)"""
     if dt is None:
         dt = get_ukraine_time()
-
     return dt.strftime('%d.%m.%y %H:%M:%S')
 
-# === Функции работы с Redis ===
+
+# ===== Redis helpers =====
 async def has_replied(user_id: str) -> bool:
-    """Проверяет, есть ли пользователь в Redis (в таблице UsersInfo)"""
     async with redis:
-        record = await redis.load(UsersInfo, key=str(user_id))
-        return record is not None
+        return await redis.load(UsersInfo, key=str(user_id)) is not None
+
 
 async def save_replied_user(user_id: str, **kwargs):
-    """Сохраняет данные пользователя в Redis (UsersInfo)"""
     current_time = format_ukraine_time()
+
     async with redis:
         user_record = UsersInfo(
             user_id=str(user_id),
-            timestamp=current_time, 
+            timestamp=current_time,
             **kwargs
         )
         await redis.save(user_record, key=str(user_id))
-        print(f"Пользователь {user_id} сохранён в Redis")
+
+    safe_log(f"Пользователь {user_id} сохранён в Redis")
+
 
 async def remove_user_from_redis(user_id: str):
-    """Удаляет пользователя из Redis (UsersInfo)"""
-    current_time = format_ukraine_time()
     async with redis:
         await redis.delete(UsersInfo, key=str(user_id))
 
-# === Локи для защиты от спама ===
+    safe_log(f"Пользователь {user_id} удалён из Redis")
+
+
+# ===== Локи =====
 async def set_user_lock(user_id: str):
-    """Устанавливает локу для пользователя на время LOCK_EXPIRATION"""
-    current_time = format_ukraine_time()
     user_locks[user_id] = True
     await asyncio.sleep(LOCK_EXPIRATION)
     user_locks.pop(user_id, None)
 
-async def register_proces(user_id: str, proces_type: str, data: dict = None):
-    """Регистрирует процесс для пользователя в Redis"""
+
+def is_user_locked(user_id: str) -> bool:
+    return user_locks.get(user_id, False)
+
+
+# ===== Процессы =====
+async def register_proces(user_id: str, proces_type: str, data: dict | None = None):
     if data is None:
         data = {}
-    
+
     current_time = format_ukraine_time()
-    
+
     async with redis:
         user_record = await redis.load(UsersInfo, key=str(user_id))
-        
+
         if user_record:
             user_record.proces_type = proces_type
             user_record.proces_data = data
             user_record.proces_started = current_time
-            user_record.last_activity = current_time  
-            
-            await redis.save(user_record, key=str(user_id))
-            print(f"[Redis] Процесс '{proces_type}' зарегистрирован для пользователя {user_id} в {current_time}")
+            user_record.last_activity = current_time
         else:
             user_record = UsersInfo(
                 user_id=str(user_id),
                 proces_type=proces_type,
                 proces_data=data,
                 proces_started=current_time,
-                last_activity=current_time, 
-                timestamp=current_time       
+                last_activity=current_time,
+                timestamp=current_time
             )
-            await redis.save(user_record, key=str(user_id))
-            print(f"[Redis] Создана новая запись с процессом '{proces_type}' для пользователя {user_id} в {current_time}")
 
-# === Функции обработки пользователя ===
+        await redis.save(user_record, key=str(user_id))
+
+    safe_log(f"Процесс '{proces_type}' зарегистрирован для пользователя {user_id}")
+
+
+# ===== Извлечение пользователя =====
 async def extract_user_info(event, client):
-    """Извлекает информацию о пользователе из события"""
     sender = await event.get_sender()
     if sender is None:
-        print(f"Ошибка: Не удалось получить отправителя в {format_ukraine_time()}")
+        safe_log("Ошибка: не удалось получить отправителя")
         return None
-    
+
     user_info = {
         'user_id': str(sender.id),
         'chat_id': event.chat_id,
-        'phone': sender.phone if sender.phone else "No phone number",
-        'username': sender.username if sender.username else "None",
-        'first_name': sender.first_name if sender.first_name else "None",
-        'last_name': sender.last_name if sender.last_name else "None",
-        'link': f"https://t.me/{sender.username}" if sender.username and sender.username != "None" else "No link",
+        'phone': sender.phone or "No phone number",
+        'username': sender.username or "None",
+        'first_name': sender.first_name or "None",
+        'last_name': sender.last_name or "None",
+        'link': (
+            f"https://t.me/{sender.username}"
+            if sender.username else "No link"
+        ),
         'message_text': event.message.text.strip() if event.message.text else "",
     }
-    
-    # Определяем язык пользователя
-    user_info['lang'] = await get_user_language(client, user_info['user_id'], user_info['message_text'])
+
+    user_info['lang'] = await get_user_language(
+        client,
+        user_info['user_id'],
+        user_info['message_text']
+    )
     user_info['message_text_lower'] = user_info['message_text'].lower()
-    
+
     return user_info
 
+
+# ===== Приветствие =====
 async def handle_welcome_message(client, user_info, is_reset=False):
-    """Отправляет приветственное сообщение пользователю"""
-    current_time = format_ukraine_time()
-    
     try:
         if os.path.exists(VIDEO_FILE):
             await client.send_file(
@@ -140,27 +170,25 @@ async def handle_welcome_message(client, user_info, is_reset=False):
             chat_id=user_info['chat_id'],
             link=user_info['link']
         )
-        
-        log_msg = f"Приветствие отправлено пользователю {user_info['user_id']}"
+
         if is_reset:
-            log_msg = f"Приветствие отправлено пользователю {user_info['user_id']} после команды !start"
-        print(log_msg)
-        
+            safe_log(f"Приветствие отправлено пользователю {user_info['user_id']} после команды !start")
+        else:
+            safe_log(f"Приветствие отправлено пользователю {user_info['user_id']}")
+
         return True
-        
+
     except YouBlockedUserError:
-        print(f"Пользователь {user_info['user_id']} заблокировал бота")
-        return False
-    except Exception as e:
-        print(f"Не удалось отправить приветственное сообщение в: {e}")
+        safe_log(f"Пользователь {user_info['user_id']} заблокировал бота")
         return False
 
+    except Exception as e:
+        safe_log(f"Ошибка отправки приветствия пользователю {user_info['user_id']}: {e}")
+        return False
+
+
+# ===== Reset =====
 async def handle_user_reset(user_id: str):
-    """Обрабатывает сброс пользователя"""
-    current_time = format_ukraine_time()
     await remove_user_from_redis(user_id)
     user_locks.pop(user_id, None)
-
-def is_user_locked(user_id: str) -> bool:
-    """Проверяет, есть ли активная лока у пользователя"""
-    return user_locks.get(user_id, False)
+    safe_log(f"Данные пользователя {user_id} сброшены")
