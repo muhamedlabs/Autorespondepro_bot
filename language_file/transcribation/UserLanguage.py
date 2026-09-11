@@ -1,12 +1,10 @@
 from langdetect import detect, DetectorFactory
-from langid.langid import LanguageIdentifier, model
 from ashredis import MISSING
 from BANNED_FILES.config import RedisManager
 from redis_storage.users_contest import UsersContest
 
 # Фиксируем случайность определения языка
 DetectorFactory.seed = 0
-langid_identifier = LanguageIdentifier.from_modelstring(model, norm_probs=True)
 
 # Инициализация Redis
 redis = RedisManager()
@@ -22,15 +20,11 @@ async def get_user_language(client, user_id: str, message_text: str):
         message_text = ""
         lang_code = "ru"
     else:
-        # Сначала пробуем определить язык через langdetect
+        # Определяем язык через langdetect
         try:
             detected_lang = detect(message_text)
         except Exception:
             detected_lang = "unknown"
-
-        # Если результат непонятный — проверяем через langid
-        if detected_lang not in ["ru", "en", "uk"]:
-            detected_lang, _ = langid_identifier.classify(message_text)
 
         # Если язык русский, английский или украинский — используем его, иначе русский
         lang_code = detected_lang if detected_lang in ["ru", "en", "uk"] else "ru"
